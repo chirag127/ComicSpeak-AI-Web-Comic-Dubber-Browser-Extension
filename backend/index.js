@@ -1,10 +1,10 @@
 const app = require('./ocr');
 const PORT = process.env.PORT || 3000;
 
-// Check if GEMINI_API_KEY is set
-if (!process.env.GEMINI_API_KEY) {
-  console.error("ERROR: GEMINI_API_KEY is not set in the environment variables.");
-  console.error("Please create a .env file with your GEMINI_API_KEY or set it in your environment.");
+// Check if CEREBRAS_API_KEY is set
+if (!process.env.CEREBRAS_API_KEY) {
+  console.error("ERROR: CEREBRAS_API_KEY is not set in the environment variables.");
+  console.error("Please create a .env file with your CEREBRAS_API_KEY or set it in your environment.");
   process.exit(1);
 }
 

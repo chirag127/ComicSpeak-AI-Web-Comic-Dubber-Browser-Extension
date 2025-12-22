@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   build-and-verify:
-    name: 'Build & Verify'
+    name: 'Build & Verify Extension'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -36,22 +36,30 @@ jobs:
         run: npm install
 
       - name: '4. Lint & Format Check (Biome)'
-        run: npm run lint:check
-        # In package.json: "lint:check": "npx @biomejs/biome check ./src"
+        run: npx @biomejs/biome check ./
 
       - name: '5. Build Production Artifact'
-        run: npm run build
-        # In package.json: "build": "vite build"
+        run: echo "No build step for extension"
 
-      - name: '6. Run Unit & Integration Tests (Vitest)'
-        run: npm run test:ci
-        # In package.json: "test:ci": "vitest run --coverage"
+  backend:
+    name: 'Test Backend'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./backend
+    steps:
+      - name: '1. Checkout Repository'
+        uses: actions/checkout@v4
 
-      - name: '7. Upload Test Coverage to Codecov'
-        uses: codecov/codecov-action@v4
-        env:
-          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+      - name: '2. Setup Node.js Environment (v18)'
+        uses: actions/setup-node@v4
         with:
-          slug: chirag127/ComicNarrate-AI-Web-Comic-Dubber-Browser-Extension
-          fail_ci_if_error: true
-          verbose: true
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+
+      - name: '3. Install Dependencies'
+        run: npm ci
+
+      - name: '4. Run Tests'
+        run: npm test

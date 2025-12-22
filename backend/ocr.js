@@ -1,5 +1,5 @@
-const { GoogleGenerativeAI } = require("@google/generative-ai");
-const fs = require("node:fs");
+const { OpenAI } = require("openai");
+const fs = require("node:fs/promises");
 const mime = require("mime-types");
 const express = require("express");
 const multer = require("multer");
@@ -9,179 +9,175 @@ require("dotenv").config();
 
 const app = express();
 app.use(cors());
+
+// Configure multer for file uploads
 const upload = multer({ dest: "uploads/" });
 
-// Create uploads directory if it doesn't exist
-const uploadsDir = path.join(__dirname, "uploads");
-if (!fs.existsSync(uploadsDir)) {
-    fs.mkdirSync(uploadsDir, { recursive: true });
-}
-
-const apiKey = process.env.GEMINI_API_KEY;
-const genAI = new GoogleGenerativeAI(apiKey);
-
-// const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
-const model = genAI.getGenerativeModel({
-    model: "gemini-2.5-flash-preview-04-17",
+// --- CEREBRAS AI Configuration ---
+const CEREBRAS_API_KEY = process.env.CEREBRAS_API_KEY;
+const client = new OpenAI({
+    baseURL: "https://api.cerebras.ai/v1",
+    apiKey: CEREBRAS_API_KEY,
 });
 
-// Function to convert file to base64
-async function fileToGenerativePart(filePath, mimeType) {
-    const fileData = await fs.promises.readFile(filePath);
-    return {
-        inlineData: {
-            data: fileData.toString("base64"),
-            mimeType,
-        },
-    };
+// --- Utility Functions ---
+
+/**
+ * Converts an image file to a base64 data URL.
+ * @param {string} filePath - The path to the image file.
+ * @param {string} mimeType - The MIME type of the image.
+ * @returns {Promise<string>} A promise that resolves to the data URL.
+ */
+async function imageToDataURL(filePath, mimeType) {
+    const fileData = await fs.readFile(filePath);
+    const base64Data = fileData.toString("base64");
+    return `data:${mimeType};base64,${base64Data}`;
 }
 
-// Clean up uploaded files periodically
-function cleanupUploads() {
-    fs.readdir(uploadsDir, (err, files) => {
-        if (err) {
-            console.error("Error reading uploads directory:", err);
-            return;
+/**
+ * Cleans up old files from the uploads directory.
+ */
+async function cleanupUploads() {
+    const uploadsDir = path.join(__dirname, "uploads");
+    try {
+        if (!fs.existsSync(uploadsDir)) {
+            await fs.mkdir(uploadsDir, { recursive: true });
         }
 
+        const files = await fs.readdir(uploadsDir);
         const now = Date.now();
-        files.forEach((file) => {
-            const filePath = path.join(uploadsDir, file);
-            fs.stat(filePath, (err, stats) => {
-                if (err) {
-                    console.error(
-                        `Error getting stats for file ${filePath}:`,
-                        err
-                    );
-                    return;
-                }
 
-                // Delete files older than 1 hour
-                if (now - stats.mtime.getTime() > 3600000) {
-                    fs.unlink(filePath, (err) => {
-                        if (err) {
-                            console.error(
-                                `Error deleting file ${filePath}:`,
-                                err
-                            );
-                        }
-                    });
-                }
-            });
-        });
-    });
+        for (const file of files) {
+            const filePath = path.join(uploadsDir, file);
+            const stats = await fs.stat(filePath);
+
+            // Delete files older than 1 hour (3600000 ms)
+            if (now - stats.mtime.getTime() > 3600000) {
+                await fs.unlink(filePath);
+                console.log(`Deleted old file: ${filePath}`);
+            }
+        }
+    } catch (err) {
+        console.error("Error during upload cleanup:", err);
+    }
 }
 
-// Run cleanup every hour
-setInterval(cleanupUploads, 3600000);
 
-// Handle single image OCR
-app.post("/ocr", upload.single("image"), async (req, res) => {
-    try {
-        if (!req.file) {
-            return res.status(400).json({ error: "No image file provided" });
-        }
-
-        const mimeType = mime.lookup(req.file.originalname) || "image/jpeg";
-
-        // Convert image file to base64
-        const imagePart = await fileToGenerativePart(req.file.path, mimeType);
-
-        // Generate content with the image
-        const result = await model.generateContent(
-            [
-                imagePart,
-                "You are an OCR system for comic images. Extract ALL text visible in this comic image, including dialogue in speech bubbles, captions, sound effects, and any other text. Return ONLY the extracted text, formatted as a single paragraph with proper punctuation. If no text is found, respond with 'No text detected in this image.'",
-            ],
-            {
-                generationConfig: {
-                    temperature: 0.1,
-                    topP: 0.95,
-                    maxOutputTokens: 4096,
-                },
-            }
-        );
-
-        const extractedText = result.response.text();
-
-        // Clean up the uploaded file
-        fs.unlink(req.file.path, (err) => {
-            if (err) {
-                console.error("Error deleting file:", err);
-            }
-        });
-
-        res.json({ text: extractedText });
-    } catch (error) {
-        console.error("OCR Error:", error);
-        res.status(500).json({
-            error: "Failed to extract text.",
-            details: error.message,
-        });
-    }
-});
-
-// Handle multiple images OCR
-app.post("/ocr-batch", upload.array("images", 5), async (req, res) => {
-    try {
-        if (!req.files || req.files.length === 0) {
-            return res.status(400).json({ error: "No image files provided" });
-        }
-
-        console.log(`Processing batch of ${req.files.length} images`);
-
-        // Convert all image files to base64
-        const imageParts = [];
-        for (const file of req.files) {
-            const mimeType = mime.lookup(file.originalname) || "image/jpeg";
-            const imagePart = await fileToGenerativePart(file.path, mimeType);
-            imageParts.push(imagePart);
-        }
-
-        // Create chat session with all images
-        const chatSession = model.startChat({
-            generationConfig: {
-                temperature: 0.1,
-                topP: 0.95,
-                maxOutputTokens: 8192,
-            },
-            history: [
-                {
-                    role: "user",
-                    parts: [...imageParts],
-                },
-            ],
-        });
-
-        // Send message to extract text from all images
-        const result = await chatSession.sendMessage(
-            "You are an OCR system for comic images. Extract ALL text visible in these comic images, including dialogue in speech bubbles, captions, sound effects, and any other text. For each image, start with 'IMAGE X:' (where X is the image number) and then provide the extracted text. If no text is found in an image, respond with 'No text detected in this image.'"
-        );
-
-        const extractedText = result.response.text();
-
-        // Clean up the uploaded files
-        for (const file of req.files) {
-            fs.unlink(file.path, (err) => {
-                if (err) {
-                    console.error(`Error deleting file ${file.path}:`, err);
-                }
-            });
-        }
-
-        res.json({ text: extractedText });
-    } catch (error) {
-        console.error("OCR Error:", error);
-        res.status(500).json({
-            error: "Failed to extract text.",
-            details: error.message,
-        });
-    }
-});
+// --- API Endpoints ---
 
 // Health check endpoint
 app.get("/health", (_, res) => {
-    res.json({ status: "ok" });
+    res.status(200).json({ status: "ok", message: "Server is healthy." });
 });
+
+// Single image OCR endpoint
+app.post("/ocr", upload.single("image"), async (req, res) => {
+    if (!req.file) {
+        return res.status(400).json({ error: "No image file was provided." });
+    }
+
+    const { path: filePath, originalname } = req.file;
+
+    try {
+        const mimeType = mime.lookup(originalname) || "image/jpeg";
+        const imageDataURL = await imageToDataURL(filePath, mimeType);
+
+        const completion = await client.chat.completions.create({
+            model: "qwen-3-235b-a22b-instruct-2507", // Tier 2 Heavy Reasoning Model
+            max_tokens: 4096,
+            messages: [
+                {
+                    role: "user",
+                    content: [
+                        {
+                            type: "text",
+                            text: "You are an expert OCR system for webcomics. Your task is to extract ALL text from the provided image. This includes dialogue, narration boxes, sound effects, and any other text. Return ONLY the extracted text as a single, clean paragraph. If no text is found, respond with 'No text detected in this image.'",
+                        },
+                        {
+                            type: "image_url",
+                            image_url: { url: imageDataURL },
+                        },
+                    ],
+                },
+            ],
+        });
+
+        const extractedText = completion.choices[0]?.message?.content?.trim() || "Failed to extract text.";
+        res.json({ text: extractedText });
+
+    } catch (error) {
+        console.error("Cerebras API Error (/ocr):", error);
+        res.status(500).json({
+            error: "An error occurred during text extraction.",
+            details: error.message,
+        });
+    } finally {
+        // Ensure the uploaded file is always deleted
+        await fs.unlink(filePath).catch(err => console.error(`Failed to delete temp file ${filePath}:`, err));
+    }
+});
+
+
+// Batch image OCR endpoint
+app.post("/ocr-batch", upload.array("images", 10), async (req, res) => {
+    if (!req.files || req.files.length === 0) {
+        return res.status(400).json({ error: "No image files were provided." });
+    }
+
+    const filesToDelete = req.files.map(f => f.path);
+
+    try {
+        const imageContent = [];
+        for (const file of req.files) {
+            const mimeType = mime.lookup(file.originalname) || "image/jpeg";
+            const imageDataURL = await imageToDataURL(file.path, mimeType);
+            imageContent.push({
+                type: "image_url",
+                image_url: { url: imageDataURL },
+            });
+        }
+
+        const completion = await client.chat.completions.create({
+            model: "qwen-3-235b-a22b-instruct-2507",
+            max_tokens: 8192,
+            messages: [
+                {
+                    role: "user",
+                    content: [
+                        {
+                            type: "text",
+                            text: "You are an expert OCR system for webcomics. You will receive a batch of images. For each image, extract ALL text (dialogue, narration, sound effects). Present the output sequentially. Start each image's text with 'IMAGE X:' (where X is the 1-based index of the image). If an image contains no text, write 'No text detected in this image.' for that entry.",
+                        },
+                        ...imageContent,
+                    ],
+                },
+            ],
+        });
+
+        const extractedText = completion.choices[0]?.message?.content?.trim() || "Failed to extract text from batch.";
+        res.json({ text: extractedText });
+
+    } catch (error) {
+        console.error("Cerebras API Error (/ocr-batch):", error);
+        res.status(500).json({
+            error: "An error occurred during batch text extraction.",
+            details: error.message,
+        });
+    } finally {
+        // Clean up all uploaded files
+        for (const filePath of filesToDelete) {
+            await fs.unlink(filePath).catch(err => console.error(`Failed to delete temp file ${filePath}:`, err));
+        }
+    }
+});
+
+
+// --- Server Initialization ---
+// Create uploads directory if it doesn't exist and run periodic cleanup
+(async () => {
+    await cleanupUploads(); // Initial cleanup
+    setInterval(cleanupUploads, 3600000); // Run cleanup every hour
+})();
+
 
 module.exports = app;
