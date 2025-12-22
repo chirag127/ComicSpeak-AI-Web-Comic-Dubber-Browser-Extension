@@ -1,645 +1,445 @@
-// Global variables
-let isReading = false;
-let textQueue = [];
-let imageQueue = [];
-let currentSettings = {
-    voiceIndex: 0,
-    rate: 1.0,
-    pitch: 1.0,
-    volume: 1.0,
-    batchSize: 5,
-    backendUrl: "https://visual-web-comic-dubber.onrender.com",
-};
-let processedImages = new Set();
-let currentHighlightedImage = null;
-let isProcessingNextImage = false;
-let currentImageIndex = -1;
-let currentBatchIndex = 0;
-let batchSize = 5; // Default batch size, will be updated from settings
-let batchResults = {}; // Store OCR results for each batch
+/**
+ * @file Content script for the Comic Dubber extension.
+ * This script is injected into web pages to find, process, and read comic images.
+ */
 
-// Initialize speech synthesis
-const synth = window.speechSynthesis;
+const ComicReader = {
+    // --- STATE ---
+    state: {
+        isReading: false,
+        textQueue: [],
+        imageQueue: [],
+        processedImages: new Set(),
+        currentHighlightedImage: null,
+        currentImageIndex: -1,
+        currentBatchIndex: 0,
+        batchResults: {},
+    },
 
-// Listen for messages from popup
-chrome.runtime.onMessage.addListener((message, _, sendResponse) => {
-    if (message.action === "startReading") {
-        // Update settings
-        currentSettings = {
-            voiceIndex: parseInt(message.settings.voiceIndex, 10),
-            rate: parseFloat(message.settings.rate),
-            pitch: parseFloat(message.settings.pitch),
-            volume: parseFloat(message.settings.volume),
-            batchSize: parseInt(message.settings.batchSize, 10),
-            backendUrl: message.settings.backendUrl,
-        };
+    // --- SETTINGS ---
+    settings: {
+        voiceIndex: 0,
+        rate: 1.0,
+        pitch: 1.0,
+        volume: 1.0,
+        batchSize: 5,
+        backendUrl: "https://visual-web-comic-dubber.onrender.com",
+    },
 
-        // Update batch size from settings
-        batchSize = currentSettings.batchSize;
+    // --- INITIALIZATION ---
+    init() {
+        chrome.runtime.onMessage.addListener((message, _, sendResponse) => {
+            if (message.action === "startReading") {
+                this.startReading(message.settings)
+                    .then(() => sendResponse({ success: true }))
+                    .catch(error => {
+                        console.error("Error starting reading:", error);
+                        sendResponse({ success: false, error: error.message });
+                    });
+                return true; // Keep message channel open for async response
+            } else if (message.action === "stopReading") {
+                this.stopReading();
+                sendResponse({ success: true });
+            }
+        });
+    },
 
-        console.log("Received settings:", currentSettings);
-        console.log(`Batch size set to ${batchSize} images`);
+    // --- CORE ACTIONS ---
+    async startReading(newSettings) {
+        if (this.state.isReading) {
+            console.log("Already reading. Settings updated.");
+            this.settings = { ...this.settings, ...newSettings };
+            return;
+        }
 
-        // Start reading if not already reading
-        if (!isReading) {
-            isReading = true;
-            processedImages.clear();
-            textQueue = [];
+        console.log("Starting comic reading...");
+        this.settings = { ...this.settings, ...newSettings };
+        this.state.isReading = true;
+        this.resetState();
 
-            // Start processing images
-            processComicImages()
-                .then(() => {
-                    sendResponse({ success: true });
-                })
-                .catch((error) => {
-                    console.error("Error processing comic images:", error);
-                    sendResponse({ error: error.message });
-                    isReading = false;
+        await this.processComicImages();
+    },
+
+    stopReading() {
+        console.log("Stopping comic reading.");
+        this.state.isReading = false;
+        this.resetState();
+        this.tts.stop();
+        this.ui.removeHighlight();
+    },
+
+    // --- LOGIC ---
+    resetState() {
+        this.state.textQueue = [];
+        this.state.imageQueue = [];
+        this.state.processedImages.clear();
+        this.state.currentHighlightedImage = null;
+        this.state.currentImageIndex = -1;
+        this.state.currentBatchIndex = 0;
+        this.state.batchResults = {};
+    },
+
+    async processComicImages() {
+        // 1. Force lazy-loaded images to load
+        await this.utils.forceLazyLoad();
+
+        // 2. Find and filter images using advanced logic
+        const comicImages = this.utils.findComicImages();
+        if (comicImages.length === 0) {
+            console.log("No valid comic images found.");
+            this.tts.speak("No comic images found on this page.");
+            this.stopReading();
+            return;
+        }
+
+        // 3. Sort images by vertical position
+        this.state.imageQueue = comicImages.sort((a, b) => {
+            return a.getBoundingClientRect().top - b.getBoundingClientRect().top;
+        });
+        console.log(`Found and sorted ${this.state.imageQueue.length} comic images.`);
+
+        // 4. Process images in batches for OCR
+        await this.processAllBatches();
+
+        // 5. Start reading the first image's text
+        await this.processNextImage();
+    },
+
+    async processAllBatches() {
+        while (this.state.currentBatchIndex < this.state.imageQueue.length) {
+            if (!this.state.isReading) return;
+
+            const batchStart = this.state.currentBatchIndex;
+            const batchEnd = Math.min(batchStart + this.settings.batchSize, this.state.imageQueue.length);
+            const currentBatch = this.state.imageQueue.slice(batchStart, batchEnd);
+
+            console.log(`Processing batch ${batchStart + 1}-${batchEnd} of ${this.state.imageQueue.length}`);
+
+            try {
+                const blobs = await Promise.all(currentBatch.map(img => this.utils.imageToBlob(img)));
+                const batchText = await this.ocr.extractTextFromBatch(blobs);
+                const textParts = this.utils.parseBatchText(batchText);
+
+                textParts.forEach((text, i) => {
+                    const imageIndex = batchStart + i;
+                    this.state.batchResults[imageIndex] = text;
                 });
-        } else {
-            sendResponse({ success: true, message: "Already reading" });
+
+            } catch (error) {
+                console.error(`Error processing batch starting at index ${batchStart}:`, error);
+                // Mark batch as failed so we can fall back to single OCR if needed
+                for (let i = 0; i < currentBatch.length; i++) {
+                     this.state.batchResults[batchStart + i] = "BATCH_OCR_FAILED";
+                }
+            }
+            this.state.currentBatchIndex = batchEnd;
+        }
+    },
+
+    async processNextImage() {
+        if (!this.state.isReading) return;
+
+        this.state.currentImageIndex++;
+        if (this.state.currentImageIndex >= this.state.imageQueue.length) {
+            console.log("Finished processing all images.");
+            this.stopReading();
+            return;
         }
 
-        return true; // Keep the message channel open for async response
-    } else if (message.action === "stopReading") {
-        stopReading();
-        sendResponse({ success: true });
-    }
-});
-
-// Function to detect and process comic images
-async function processComicImages() {
-    // Reset state
-    textQueue = [];
-    imageQueue = [];
-    currentImageIndex = -1;
-    currentBatchIndex = 0;
-    batchResults = {};
-    isProcessingNextImage = false;
-
-    // Find all images on the page
-    const images = Array.from(document.querySelectorAll("img"));
-
-    // Log the number of images found
-    console.log(`Found ${images.length} images on the page`);
-
-    // Filter for likely comic images (larger than 200x200 pixels)
-    const comicImages = images.filter((img) => {
-        const isValid =
-            img.complete &&
-            img.naturalWidth > 200 &&
-            img.naturalHeight > 200 &&
-            isVisible(img) &&
-            !processedImages.has(img.src);
-
-        if (isValid) {
-            console.log(
-                `Found valid comic image: ${img.src} (${img.naturalWidth}x${img.naturalHeight})`
-            );
-        }
-
-        return isValid;
-    });
-
-    if (comicImages.length === 0) {
-        console.log("No comic images found on this page");
-        speak(
-            "No comic images found on this page. Try scrolling down to load more images."
-        );
-        isReading = false;
-        return;
-    }
-
-    console.log(`Found ${comicImages.length} comic images`);
-
-    // Sort images by their vertical position (top to bottom)
-    imageQueue = comicImages.sort((a, b) => {
-        const rectA = a.getBoundingClientRect();
-        const rectB = b.getBoundingClientRect();
-        return rectA.top - rectB.top;
-    });
-
-    console.log(`Sorted ${imageQueue.length} comic images by position`);
-
-    // Process images in batches
-    await processBatch();
-
-    // Start processing the first image
-    await processNextImage();
-}
-
-// Process a batch of images
-async function processBatch() {
-    if (!isReading || currentBatchIndex >= imageQueue.length) {
-        return;
-    }
-
-    const batchEnd = Math.min(currentBatchIndex + batchSize, imageQueue.length);
-    const currentBatch = imageQueue.slice(currentBatchIndex, batchEnd);
-
-    console.log(
-        `Processing batch of ${currentBatch.length} images (${
-            currentBatchIndex + 1
-        }-${batchEnd} of ${imageQueue.length})`
-    );
-
-    try {
-        // Convert all images in the batch to blobs
-        const batchBlobs = await Promise.all(
-            currentBatch.map(async (img) => {
-                return {
-                    blob: await imageToBlob(img),
-                    index: imageQueue.indexOf(img),
-                };
-            })
-        );
-
-        // Send the batch to the OCR service
-        const batchText = await extractTextFromBatch(
-            batchBlobs.map((item) => item.blob)
-        );
-
-        // Parse the batch results
-        const textParts = parseBatchText(batchText);
-
-        // Store the results for each image
-        for (
-            let i = 0;
-            i < Math.min(textParts.length, currentBatch.length);
-            i++
-        ) {
-            const imgIndex = batchBlobs[i].index;
-            batchResults[imgIndex] = textParts[i];
-        }
-
-        // Update the batch index
-        currentBatchIndex = batchEnd;
-
-        // Process the next batch if there are more images
-        if (currentBatchIndex < imageQueue.length) {
-            await processBatch();
-        }
-    } catch (error) {
-        console.error("Error processing batch:", error);
-        // Continue with the next batch
-        currentBatchIndex = Math.min(
-            currentBatchIndex + batchSize,
-            imageQueue.length
-        );
-        if (currentBatchIndex < imageQueue.length) {
-            await processBatch();
-        }
-    }
-}
-
-// Process the next image in the queue
-async function processNextImage() {
-    if (!isReading || imageQueue.length === 0) {
-        // If we've processed all images and no text was found
-        if (textQueue.length === 0) {
-            speak("No text could be extracted from the comic images.");
-            isReading = false;
-        }
-        return;
-    }
-
-    currentImageIndex++;
-    if (currentImageIndex >= imageQueue.length) {
-        console.log("Reached the end of the image queue");
-        return;
-    }
-
-    const img = imageQueue[currentImageIndex];
-    console.log(
-        `Processing image ${currentImageIndex + 1}/${imageQueue.length}: ${
-            img.src
-        }`
-    );
-
-    try {
-        // Mark image as processed
-        processedImages.add(img.src);
-
-        // Highlight the current image
-        highlightImage(img);
-
-        // Scroll to the image
+        const img = this.state.imageQueue[this.state.currentImageIndex];
+        this.state.processedImages.add(img.src);
+        this.ui.highlightImage(img);
         img.scrollIntoView({ behavior: "smooth", block: "center" });
 
-        // Get text from batch results or extract it if not available
-        let text;
-        if (batchResults[currentImageIndex]) {
-            text = batchResults[currentImageIndex];
-            console.log(
-                `Using pre-processed text from batch for image ${
-                    currentImageIndex + 1
-                }`
-            );
-        } else {
-            text = await extractTextFromImage(img);
-        }
-
-        if (text && text.trim()) {
-            console.log(
-                `Text for image ${currentImageIndex + 1}: ${text.substring(
-                    0,
-                    50
-                )}...`
-            );
-            // Add text to queue
-            textQueue.push({
-                text: text,
-                image: img,
-            });
-
-            // If this is the first text, start speaking
-            if (textQueue.length === 1) {
-                speakNextInQueue();
-            }
-        } else {
-            console.log(`No text found in image ${currentImageIndex + 1}`);
-            // If no text was found, remove highlight and process next image
-            removeHighlight();
-            await processNextImage();
-        }
-    } catch (error) {
-        console.error(
-            `Error processing image ${currentImageIndex + 1}:`,
-            error
-        );
-        // Continue with next image
-        removeHighlight();
-        await processNextImage();
-    }
-}
-
-// Extract text from a batch of images
-async function extractTextFromBatch(blobs) {
-    try {
-        console.log(`Sending batch of ${blobs.length} images to OCR service`);
-
-        // Create form data with multiple images
-        const formData = new FormData();
-        blobs.forEach((blob, index) => {
-            formData.append("images", blob, `comic_image_${index}.jpg`);
-        });
-
-        // Send to backend
-        console.log(
-            `Sending batch to OCR service at ${currentSettings.backendUrl}/ocr-batch`
-        );
-        const response = await fetch(
-            `${currentSettings.backendUrl}/ocr-batch`,
-            {
-                method: "POST",
-                body: formData,
-            }
-        );
-
-        if (!response.ok) {
-            let errorMessage = `Server returned ${response.status} ${response.statusText}`;
-            try {
-                const errorData = await response.json();
-                errorMessage = errorData.error || errorMessage;
-                if (errorData.details) {
-                    errorMessage += `: ${errorData.details}`;
-                }
-            } catch (e) {
-                console.error("Failed to parse error response as JSON:", e);
-            }
-            throw new Error(errorMessage);
-        }
-
-        const data = await response.json();
-        console.log(
-            `Batch OCR result received: ${
-                data.text ? data.text.substring(0, 100) + "..." : "No text"
-            }`
-        );
-
-        return data.text;
-    } catch (error) {
-        console.error("Batch OCR Error:", error);
-        throw error;
-    }
-}
-
-// Parse the batch text result into individual image texts
-function parseBatchText(batchText) {
-    if (!batchText) return [];
-
-    // Split by IMAGE X: pattern
-    const regex = /IMAGE \d+:\s*(.*?)(?=IMAGE \d+:|$)/gs;
-    const matches = [];
-    let match;
-
-    while ((match = regex.exec(batchText)) !== null) {
-        if (match[1]) {
-            matches.push(match[1].trim());
-        }
-    }
-
-    // If no matches found, try to use the whole text
-    if (matches.length === 0 && batchText.trim()) {
-        matches.push(batchText.trim());
-    }
-
-    console.log(`Parsed ${matches.length} text segments from batch result`);
-    return matches;
-}
-
-// Pre-process the next image while speaking the current one
-async function preProcessNextImage() {
-    // We don't need this anymore since we're using batch processing
-    return;
-}
-
-// Highlight the current image being processed
-function highlightImage(img) {
-    // Remove any existing highlight
-    removeHighlight();
-
-    // Store the original style
-    currentHighlightedImage = {
-        element: img,
-        originalOutline: img.style.outline,
-        originalOutlineOffset: img.style.outlineOffset,
-        originalBoxShadow: img.style.boxShadow,
-        originalBorder: img.style.border,
-    };
-
-    // Apply highlight
-    img.style.outline = "4px solid #4285f4";
-    img.style.outlineOffset = "3px";
-    img.style.boxShadow = "0 0 20px rgba(66, 133, 244, 0.8)";
-    img.style.border = "2px solid #4285f4";
-
-    console.log(`Highlighted image: ${img.src}`);
-}
-
-// Remove highlight from the current image
-function removeHighlight() {
-    if (currentHighlightedImage) {
-        const img = currentHighlightedImage.element;
-        img.style.outline = currentHighlightedImage.originalOutline;
-        img.style.outlineOffset = currentHighlightedImage.originalOutlineOffset;
-        img.style.boxShadow = currentHighlightedImage.originalBoxShadow;
-        img.style.border = currentHighlightedImage.originalBorder;
-
-        console.log(`Removed highlight from image: ${img.src}`);
-        currentHighlightedImage = null;
-    }
-}
-
-// Function to extract text from an image using the backend OCR service
-async function extractTextFromImage(img) {
-    try {
-        console.log(`Extracting text from image: ${img.src}`);
-
-        // Convert image to blob
-        const blob = await imageToBlob(img);
-        console.log(
-            `Image blob created: ${blob.size} bytes, type: ${blob.type}`
-        );
-
-        // Create form data
-        const formData = new FormData();
-        formData.append("image", blob, "comic_image.jpg");
-
-        // Send to backend
-        console.log(
-            `Sending image to OCR service at ${currentSettings.backendUrl}/ocr`
-        );
-        const response = await fetch(`${currentSettings.backendUrl}/ocr`, {
-            method: "POST",
-            body: formData,
-        });
-
-        if (!response.ok) {
-            let errorMessage = `Server returned ${response.status} ${response.statusText}`;
-            try {
-                const errorData = await response.json();
-                errorMessage = errorData.error || errorMessage;
-                if (errorData.details) {
-                    errorMessage += `: ${errorData.details}`;
-                }
-            } catch (e) {
-                // If we can't parse the error as JSON, use the status text
-                console.error("Failed to parse error response as JSON:", e);
-            }
-            throw new Error(errorMessage);
-        }
-
-        const data = await response.json();
-        console.log(
-            `OCR result received: ${
-                data.text ? data.text.substring(0, 50) + "..." : "No text"
-            }`
-        );
-
-        if (
-            !data.text ||
-            data.text.trim() === "" ||
-            data.text === "No text detected in this image."
-        ) {
-            console.log("No text detected in the image");
-            return null;
-        }
-
-        return data.text;
-    } catch (error) {
-        console.error("OCR Error:", error);
-        return null;
-    }
-}
-
-// Convert an image element to a blob
-function imageToBlob(img) {
-    return new Promise((resolve, reject) => {
         try {
-            console.log(
-                `Converting image to blob: ${img.src} (${img.naturalWidth}x${img.naturalHeight})`
-            );
+            let text = this.state.batchResults[this.state.currentImageIndex];
 
-            // Handle cross-origin images
-            if (isCrossOrigin(img.src)) {
-                console.log(
-                    "Cross-origin image detected, using fetch to get blob"
-                );
-                return fetchImageAsBlob(img.src).then(resolve).catch(reject);
+            // Fallback to single image OCR if batch failed
+            if (text === "BATCH_OCR_FAILED") {
+                console.warn(`Batch OCR failed for image ${this.state.currentImageIndex + 1}, falling back to single OCR.`);
+                text = await this.ocr.extractTextFromImage(img);
             }
 
-            // Create canvas
-            const canvas = document.createElement("canvas");
-            canvas.width = img.naturalWidth;
-            canvas.height = img.naturalHeight;
+            if (text && text.trim() && text !== "No text detected in this image.") {
+                console.log(`Queuing text for image ${this.state.currentImageIndex + 1}: "${text.substring(0, 50)}..."`);
+                this.state.textQueue.push({ text, image: img });
 
-            // Draw image to canvas
-            const ctx = canvas.getContext("2d");
-            ctx.drawImage(img, 0, 0);
-
-            // Convert to blob
-            canvas.toBlob(
-                (blob) => {
-                    if (blob) {
-                        console.log(
-                            `Successfully converted image to blob: ${blob.size} bytes`
-                        );
-                        resolve(blob);
-                    } else {
-                        console.error("Failed to convert image to blob");
-                        reject(new Error("Failed to convert image to blob"));
-                    }
-                },
-                "image/jpeg",
-                0.95
-            );
-        } catch (error) {
-            console.error("Error converting image to blob:", error);
-            reject(error);
-        }
-    });
-}
-
-// Check if URL is cross-origin
-function isCrossOrigin(url) {
-    try {
-        const parsedUrl = new URL(url);
-        return parsedUrl.origin !== window.location.origin;
-    } catch (e) {
-        return false;
-    }
-}
-
-// Fetch image as blob for cross-origin images
-async function fetchImageAsBlob(url) {
-    try {
-        const response = await fetch(url, { mode: "cors" });
-        if (!response.ok) {
-            throw new Error(
-                `Failed to fetch image: ${response.status} ${response.statusText}`
-            );
-        }
-        return await response.blob();
-    } catch (error) {
-        console.error("Error fetching image as blob:", error);
-        throw error;
-    }
-}
-
-// Check if an element is visible
-function isVisible(element) {
-    const style = window.getComputedStyle(element);
-    return (
-        style.display !== "none" &&
-        style.visibility !== "hidden" &&
-        element.offsetWidth > 0 &&
-        element.offsetHeight > 0
-    );
-}
-
-// Speak text using Web Speech API
-function speak(text) {
-    if (!text || !isReading) return;
-
-    // Cancel any ongoing speech
-    if (synth.speaking) {
-        synth.cancel();
-    }
-
-    // Create utterance
-    const utterance = new SpeechSynthesisUtterance(text);
-
-    // Set voice
-    const voices = synth.getVoices();
-    if (voices.length > 0) {
-        utterance.voice = voices[currentSettings.voiceIndex] || voices[0];
-    }
-
-    // Set other properties
-    utterance.rate = parseFloat(currentSettings.rate);
-    utterance.pitch = parseFloat(currentSettings.pitch);
-    utterance.volume = parseFloat(currentSettings.volume);
-
-    // Log speech settings for debugging
-    console.log("Speech settings:", {
-        voice: utterance.voice ? utterance.voice.name : "default",
-        rate: utterance.rate,
-        pitch: utterance.pitch,
-        volume: utterance.volume,
-    });
-
-    // Handle end of speech
-    utterance.onend = () => {
-        if (isReading) {
-            // If we're speaking from the queue, process the next item
-            if (textQueue.length > 0) {
-                // Remove the spoken text from the queue
-                textQueue.shift();
-
-                // Speak next text in queue or process next image
-                if (textQueue.length > 0) {
-                    setTimeout(() => {
-                        speakNextInQueue();
-                    }, 500); // Small pause between texts
-                } else {
-                    // If text queue is empty, process the next image
-                    setTimeout(() => {
-                        removeHighlight();
-                        processNextImage();
-                    }, 500);
+                // Start speaking if not already
+                if (!this.tts.isSpeaking()) {
+                    this.tts.speakNextInQueue();
                 }
-            }
-        }
-    };
-
-    // Handle errors
-    utterance.onerror = (event) => {
-        console.error("Speech synthesis error:", event.error);
-
-        if (textQueue.length > 0) {
-            textQueue.shift(); // Remove problematic text
-            if (textQueue.length > 0) {
-                speakNextInQueue();
             } else {
-                removeHighlight();
-                processNextImage();
+                console.log(`No text found for image ${this.state.currentImageIndex + 1}.`);
+                // No text, move to the next image immediately
+                await this.processNextImage();
             }
+        } catch (error) {
+            console.error(`Error processing image ${this.state.currentImageIndex + 1}:`, error);
+            await this.processNextImage(); // Continue with the next image
         }
-    };
+    },
 
-    // Speak the text
-    console.log(`Speaking: ${text.substring(0, 50)}...`);
-    synth.speak(utterance);
-}
 
-// Speak the next text in the queue
-function speakNextInQueue() {
-    if (textQueue.length > 0 && isReading) {
-        const item = textQueue[0];
-        // Highlight the image associated with the text
-        if (item.image) {
-            highlightImage(item.image);
+    // --- OCR SERVICE ---
+    ocr: {
+        async extractTextFromBatch(blobs) {
+            const formData = new FormData();
+            blobs.forEach((blob, index) => {
+                formData.append("images", blob, `image_${index}.jpg`);
+            });
+            const response = await this.performOcrRequest("ocr-batch", formData);
+            return response.text;
+        },
+
+        async extractTextFromImage(img) {
+            const blob = await ComicReader.utils.imageToBlob(img);
+            const formData = new FormData();
+            formData.append("image", blob, "image.jpg");
+            const response = await this.performOcrRequest("ocr", formData);
+            return response.text;
+        },
+
+        async performOcrRequest(endpoint, body) {
+            try {
+                const url = `${ComicReader.settings.backendUrl}/${endpoint}`;
+                console.log(`Sending request to OCR service: ${url}`);
+                const response = await fetch(url, { method: "POST", body });
+
+                if (!response.ok) {
+                    const errorData = await response.json().catch(() => ({}));
+                    const errorMessage = errorData.error || `Server error: ${response.status}`;
+                    throw new Error(errorMessage);
+                }
+                return await response.json();
+            } catch (error) {
+                console.error(`OCR request to /${endpoint} failed:`, error);
+                throw error;
+            }
+        },
+    },
+
+    // --- UI / DOM MANIPULATION ---
+    ui: {
+        highlightImage(img) {
+            this.removeHighlight();
+            const state = ComicReader.state;
+            state.currentHighlightedImage = {
+                element: img,
+                originalStyle: {
+                    outline: img.style.outline,
+                    boxShadow: img.style.boxShadow,
+                },
+            };
+            img.style.outline = "4px solid #4285f4";
+            img.style.boxShadow = "0 0 20px rgba(66, 133, 244, 0.8)";
+        },
+
+        removeHighlight() {
+            const { currentHighlightedImage } = ComicReader.state;
+            if (currentHighlightedImage) {
+                const { element, originalStyle } = currentHighlightedImage;
+                element.style.outline = originalStyle.outline;
+                element.style.boxShadow = originalStyle.boxShadow;
+                ComicReader.state.currentHighlightedImage = null;
+            }
+        },
+    },
+
+    // --- TEXT-TO-SPEECH ---
+    tts: {
+        synth: window.speechSynthesis,
+
+        speak(text) {
+            if (!text || !ComicReader.state.isReading) return;
+
+            this.stop(); // Ensure any previous speech is stopped.
+
+            const utterance = new SpeechSynthesisUtterance(text);
+            const settings = ComicReader.settings;
+
+            const voices = this.synth.getVoices();
+            if (voices.length > 0) {
+                utterance.voice = voices[settings.voiceIndex] || voices[0];
+            }
+
+            utterance.rate = parseFloat(settings.rate);
+            utterance.pitch = parseFloat(settings.pitch);
+            utterance.volume = parseFloat(settings.volume);
+
+            utterance.onend = () => {
+                if (ComicReader.state.isReading) {
+                    ComicReader.state.textQueue.shift();
+                    if (ComicReader.state.textQueue.length > 0) {
+                        this.speakNextInQueue();
+                    } else {
+                        ComicReader.processNextImage();
+                    }
+                }
+            };
+
+            utterance.onerror = (event) => {
+                console.error("Speech synthesis error:", event.error);
+                // Skip to next item in queue on error
+                if (ComicReader.state.isReading) {
+                    ComicReader.state.textQueue.shift();
+                    ComicReader.processNextImage();
+                }
+            };
+
+            console.log(`Speaking: "${text.substring(0, 50)}..."`);
+            this.synth.speak(utterance);
+        },
+
+        speakNextInQueue() {
+            if (ComicReader.state.textQueue.length > 0 && ComicReader.state.isReading) {
+                const { text, image } = ComicReader.state.textQueue[0];
+                ComicReader.ui.highlightImage(image);
+                this.speak(text);
+            }
+        },
+
+        stop() {
+            if (this.synth.speaking) {
+                this.synth.cancel();
+            }
+        },
+
+        isSpeaking() {
+            return this.synth.speaking;
         }
-        speak(item.text);
-    }
-}
+    },
 
-// Stop reading
-function stopReading() {
-    isReading = false;
-    textQueue = [];
-    imageQueue = [];
-    currentImageIndex = -1;
-    isProcessingNextImage = false;
+    // --- UTILITIES ---
+    utils: {
+        async imageToBlob(img) {
+            if (this.isCrossOrigin(img.src)) {
+                return this.fetchImageAsBlob(img.src);
+            }
+            return new Promise((resolve, reject) => {
+                const canvas = document.createElement("canvas");
+                canvas.width = img.naturalWidth;
+                canvas.height = img.naturalHeight;
+                const ctx = canvas.getContext("2d");
+                ctx.drawImage(img, 0, 0);
+                canvas.toBlob(blob => {
+                    if (blob) resolve(blob);
+                    else reject(new Error("Canvas to Blob conversion failed"));
+                }, "image/jpeg", 0.95);
+            });
+        },
 
-    // Cancel any ongoing speech
-    if (synth.speaking) {
-        synth.cancel();
-    }
+        isCrossOrigin(url) {
+            try {
+                return new URL(url).origin !== window.location.origin;
+            } catch (e) {
+                return true; // Assume cross-origin if URL is malformed
+            }
+        },
 
-    // Remove any highlights
-    removeHighlight();
+        async fetchImageAsBlob(url) {
+            const response = await fetch(url);
+            if (!response.ok) {
+                throw new Error(`Failed to fetch image: ${response.statusText}`);
+            }
+            return response.blob();
+        },
 
-    console.log("Reading stopped");
-}
+        parseBatchText(batchText) {
+            if (!batchText) return [];
+            const regex = /IMAGE \d+:\s*(.*?)(?=IMAGE \d+:|$)/gs;
+            const matches = [...batchText.matchAll(regex)].map(match => match[1].trim());
+            return matches.length > 0 ? matches : [batchText.trim()];
+        },
+
+        async forceLazyLoad() {
+            console.log("Forcing lazy load of images...");
+            const initialPosition = window.scrollY;
+            const documentHeight = Math.max(
+                document.body.scrollHeight,
+                document.documentElement.scrollHeight
+            );
+            const scrollStep = Math.floor(window.innerHeight * 0.8);
+            const waitTime = 100;
+
+            window.scrollTo(0, documentHeight);
+            await new Promise((resolve) => setTimeout(resolve, 200));
+
+            for (let position = documentHeight; position >= 0; position -= scrollStep * 2) {
+                window.scrollTo(0, position);
+                await new Promise((resolve) => setTimeout(resolve, waitTime));
+            }
+
+            const positions = [
+                0,
+                documentHeight / 4,
+                documentHeight / 2,
+                (documentHeight * 3) / 4,
+                documentHeight,
+            ];
+            for (const position of positions) {
+                window.scrollTo(0, position);
+                await new Promise((resolve) => setTimeout(resolve, waitTime));
+            }
+
+            window.scrollTo(0, initialPosition);
+            console.log("Fast scrolling complete.");
+        },
+
+        findComicImages() {
+            let images = [];
+            const specificSelectors = [
+                ".read-box img",
+                ".comic-container img",
+                ".manga-reader img",
+                ".chapter-container img",
+                ".page-container img",
+                ".comic-page img",
+                ".manga-page img",
+                ".read-box-block img",
+                ".el-image__inner",
+                ".read-container img",
+                ".pager-read img",
+                "[data-v-6cb544df] img",
+            ];
+
+            // Try specific selectors first
+            for (const selector of specificSelectors) {
+                images.push(...document.querySelectorAll(selector));
+            }
+
+            // If no images found, try a more general approach
+            if (images.length === 0) {
+                images.push(...document.querySelectorAll("img"));
+            }
+
+            const uniqueSrcs = new Set();
+            return images
+                .map((img) => {
+                    const imgSrc =
+                        img.src ||
+                        img.dataset.src ||
+                        img.dataset.original ||
+                        img.dataset.lazy ||
+                        img.dataset.originalSrc ||
+                        "";
+                    if (imgSrc) {
+                        img.dataset.actualSrc = imgSrc;
+                    }
+                    return img;
+                })
+                .filter((img) => {
+                    const imgSrc = img.dataset.actualSrc;
+                    if (!imgSrc || uniqueSrcs.has(imgSrc)) return false;
+
+                    const style = window.getComputedStyle(img);
+                    const isVisible = style.display !== "none" && style.visibility !== "hidden" && img.offsetWidth > 0 && img.offsetHeight > 0;
+                    if (!isVisible) return false;
+
+                    uniqueSrcs.add(imgSrc);
+                    return true;
+                });
+        },
+    },
+};
+
+ComicReader.init();

@@ -1,0 +1,18 @@
+- name: Build Status
+  shield: "https://img.shields.io/github/actions/workflow/status/chirag127/ComicNarrate-AI-Web-Comic-Dubber-Browser-Extension/ci.yml?style=flat-square"
+  url: "https://github.com/chirag127/ComicNarrate-AI-Web-Comic-Dubber-Browser-Extension/actions/workflows/ci.yml"
+- name: Code Coverage
+  shield: "https://img.shields.io/codecov/c/github/chirag127/ComicNarrate-AI-Web-Comic-Dubber-Browser-Extension?style=flat-square"
+  url: "https://codecov.io/gh/chirag127/ComicNarrate-AI-Web-Comic-Dubber-Browser-Extension"
+- name: Tech Stack
+  shield: "https://img.shields.io/badge/tech-JavaScript-informational?style=flat-square"
+  url: "https://developer.mozilla.org/en-US/docs/Web/JavaScript"
+- name: Linter
+  shield: "https://img.shields.io/badge/linted_with-Biome-informational?style=flat-square"
+  url: "https://biomejs.dev/"
+- name: License
+  shield: "https://img.shields.io/badge/license-CC_BY--NC_4.0-lightgrey?style=flat-square"
+  url: "https://creativecommons.org/licenses/by-nc/4.0/"
+- name: GitHub Stars
+  shield: "https://img.shields.io/github/stars/chirag127/ComicNarrate-AI-Web-Comic-Dubber-Browser-Extension?style=flat-square"
+  url: "https://github.com/chirag127/ComicNarrate-AI-Web-Comic-Dubber-Browser-Extension/stargazers"
